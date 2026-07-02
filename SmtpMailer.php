@@ -32,11 +32,17 @@ class SmtpMailer
     }
 
     /**
-     * Send a plain-text email.
+     * Send an email.
+     *
+     * @param string $body   The message body.
+     * @param bool   $isHtml If true, $body is treated as HTML and a
+     *                       multipart/alternative message (HTML + plain-text
+     *                       fallback) is sent. If false, a plain-text email
+     *                       is sent.
      *
      * @throws Exception on any SMTP error.
      */
-    public function send($fromEmail, $fromName, $toEmail, $subject, $body)
+    public function send($fromEmail, $fromName, $toEmail, $subject, $body, $isHtml = false)
     {
         $this->connect();
 
@@ -64,7 +70,7 @@ class SmtpMailer
 
             // Message.
             $this->command('DATA', 354);
-            $this->sendData($this->buildMessage($fromEmail, $fromName, $toEmail, $subject, $body));
+            $this->sendData($this->buildMessage($fromEmail, $fromName, $toEmail, $subject, $body, $isHtml));
             $this->command('.', 250);
 
             $this->command('QUIT', 221);
@@ -151,7 +157,7 @@ class SmtpMailer
         return $response;
     }
 
-    private function buildMessage($fromEmail, $fromName, $toEmail, $subject, $body)
+    private function buildMessage($fromEmail, $fromName, $toEmail, $subject, $body, $isHtml = false)
     {
         $fromName = $this->encodeHeader($fromName);
         $subject  = $this->encodeHeader($subject);
@@ -162,15 +168,87 @@ class SmtpMailer
         $headers[] = 'To: <' . $toEmail . '>';
         $headers[] = 'Subject: ' . $subject;
         $headers[] = 'MIME-Version: 1.0';
-        $headers[] = 'Content-Type: text/plain; charset=UTF-8';
-        $headers[] = 'Content-Transfer-Encoding: 8bit';
         $headers[] = 'Message-ID: <' . bin2hex(random_bytes(8)) . '@' . $this->clientHostname() . '>';
 
-        // Normalise line endings and dot-stuff lines starting with ".".
+        if ($isHtml) {
+            // Send both a plain-text and an HTML version so that every email
+            // client shows something sensible. Bold/formatting is preserved
+            // by the HTML part.
+            $boundary = 'bnd_' . bin2hex(random_bytes(12));
+
+            $plain = $this->htmlToPlainText($body);
+            $html  = $this->wrapHtml($body);
+
+            $headers[] = 'Content-Type: multipart/alternative; boundary="' . $boundary . '"';
+
+            $parts   = [];
+            $parts[] = '--' . $boundary;
+            $parts[] = 'Content-Type: text/plain; charset=UTF-8';
+            $parts[] = 'Content-Transfer-Encoding: 8bit';
+            $parts[] = '';
+            $parts[] = $this->prepareBody($plain);
+            $parts[] = '--' . $boundary;
+            $parts[] = 'Content-Type: text/html; charset=UTF-8';
+            $parts[] = 'Content-Transfer-Encoding: 8bit';
+            $parts[] = '';
+            $parts[] = $this->prepareBody($html);
+            $parts[] = '--' . $boundary . '--';
+
+            $bodyOut = implode("\r\n", $parts);
+        } else {
+            $headers[] = 'Content-Type: text/plain; charset=UTF-8';
+            $headers[] = 'Content-Transfer-Encoding: 8bit';
+            $bodyOut   = $this->prepareBody($body);
+        }
+
+        return implode("\r\n", $headers) . "\r\n\r\n" . $bodyOut;
+    }
+
+    /**
+     * Normalise line endings to CRLF and dot-stuff lines starting with ".".
+     */
+    private function prepareBody($body)
+    {
         $body = str_replace(["\r\n", "\r", "\n"], "\r\n", $body);
         $body = preg_replace('/^\./m', '..', $body);
+        return $body;
+    }
 
-        return implode("\r\n", $headers) . "\r\n\r\n" . $body;
+    /**
+     * Wrap the user's HTML fragment in a minimal, email-friendly document.
+     * The reset styles remove the large gaps some clients add between blocks.
+     */
+    private function wrapHtml($html)
+    {
+        return '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+            . '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+            . '<style>'
+            . 'body{margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;'
+            . 'font-size:15px;line-height:1.5;color:#1a202c;}'
+            . 'p{margin:0 0 10px;} ul,ol{margin:0 0 10px 20px;padding:0;}'
+            . 'img{max-width:100%;height:auto;}'
+            . '</style></head><body>' . $html . '</body></html>';
+    }
+
+    /**
+     * Build a readable plain-text fallback from an HTML fragment so line
+     * spacing stays compact instead of showing raw markup or huge gaps.
+     */
+    private function htmlToPlainText($html)
+    {
+        $text = $html;
+        // Turn block-level breaks into single newlines.
+        $text = preg_replace('#<\s*br\s*/?\s*>#i', "\n", $text);
+        $text = preg_replace('#</\s*(p|div|li|tr|h[1-6])\s*>#i', "\n", $text);
+        $text = preg_replace('#<\s*li[^>]*>#i', '- ', $text);
+        // Drop all remaining tags.
+        $text = strip_tags($text);
+        // Decode entities like &nbsp; &amp; etc.
+        $text = html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        // Collapse excessive blank lines and trailing spaces.
+        $text = preg_replace('/[ \t]+\n/', "\n", $text);
+        $text = preg_replace('/\n{3,}/', "\n\n", $text);
+        return trim($text);
     }
 
     private function encodeHeader($value)
